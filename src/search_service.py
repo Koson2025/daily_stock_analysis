@@ -2172,6 +2172,13 @@ class SearchService:
         "上交所", "深交所", "港交所", "证券交易所",
         "上海证券交易所", "深圳证券交易所", "香港交易所", "香港联合交易所",
     )
+    _PREFERRED_CN_FINANCE_NEWS_SOURCE_HINT = "(财联社 OR 东方财富 OR 东财)"
+    _PREFERRED_CN_FINANCE_NEWS_HOSTS = (
+        "cls.cn", "cailianpress.com", "eastmoney.com",
+    )
+    _PREFERRED_CN_FINANCE_NEWS_LABELS = (
+        "财联社", "东方财富", "东财",
+    )
     _LOW_QUALITY_DOWNLOAD_ACTION_TERMS = (
         "下载", "安装", "下载安装", "下载安装到手机", "下载链接",
         "免费下载", "客户端下载", "应用下载", "官方app下载",
@@ -2793,6 +2800,29 @@ class SearchService:
         return source_label in cls._OFFICIAL_SOURCE_LABELS
 
     @classmethod
+    def _is_preferred_cn_finance_news_source(cls, item: SearchResult) -> bool:
+        """识别财联社、东方财富等中文财经新闻源，用于排序轻微加权。"""
+        url_host = cls._candidate_hostname(item.url)
+        source_label = str(item.source or "").strip().lower()
+        source_host = (
+            cls._candidate_hostname(item.source)
+            if cls._source_resembles_hostname(item.source)
+            else ""
+        )
+
+        for host in (url_host, source_host):
+            if host and any(
+                host == preferred_host or host.endswith(f".{preferred_host}")
+                for preferred_host in cls._PREFERRED_CN_FINANCE_NEWS_HOSTS
+            ):
+                return True
+
+        return any(
+            label.lower() in source_label
+            for label in cls._PREFERRED_CN_FINANCE_NEWS_LABELS
+        )
+
+    @classmethod
     def _has_low_quality_news_page_signal(cls, item: SearchResult) -> bool:
         """Detect app/download/listing pages without relying on a domain blocklist."""
         content_text = " ".join(filter(None, [item.title, item.snippet])).lower()
@@ -3043,6 +3073,10 @@ class SearchService:
         if cls._is_trusted_official_news_source(item):
             score += 8
             add_reason("来源接近公告或交易所渠道")
+
+        if cls._is_preferred_cn_finance_news_source(item):
+            score += 6
+            add_reason("来源为财联社/东方财富等财经新闻源")
 
         has_sector_signal = cls._contains_any_news_term(full_text, cls._SECTOR_NEWS_TERMS)
         has_macro_signal = cls._contains_any_news_term(full_text, cls._MACRO_NEWS_TERMS)
@@ -3607,14 +3641,24 @@ class SearchService:
         if focus_keywords:
             # 如果提供了关键词，直接使用关键词作为查询
             query = " ".join(focus_keywords)
+            if prefer_chinese and not any(
+                source in query for source in self._PREFERRED_CN_FINANCE_NEWS_LABELS
+            ):
+                query = f"{query} {self._PREFERRED_CN_FINANCE_NEWS_SOURCE_HINT}"
         elif prefer_chinese:
-            query = f"{stock_name} {stock_code} 股票 最新消息"
+            query = (
+                f"{stock_name} {stock_code} 股票 最新消息 "
+                f"{self._PREFERRED_CN_FINANCE_NEWS_SOURCE_HINT}"
+            )
         elif is_foreign:
             # 港股/美股使用英文搜索关键词
             query = f"{stock_name} {stock_code} stock latest news"
         else:
             # 默认主查询：股票名称 + 核心关键词
-            query = f"{stock_name} {stock_code} 股票 最新消息"
+            query = (
+                f"{stock_name} {stock_code} 股票 最新消息 "
+                f"{self._PREFERRED_CN_FINANCE_NEWS_SOURCE_HINT}"
+            )
 
         logger.info(
             (
@@ -3998,7 +4042,10 @@ class SearchService:
             search_dimensions = [
                 {
                     'name': 'latest_news',
-                    'query': f"{stock_name} {stock_code} 最新 新闻 重大 事件",
+                    'query': (
+                        f"{stock_name} {stock_code} 最新 新闻 重大 事件 "
+                        f"{self._PREFERRED_CN_FINANCE_NEWS_SOURCE_HINT}"
+                    ),
                     'desc': '最新消息',
                     'tavily_topic': 'news',
                     'strict_freshness': True,
@@ -4014,7 +4061,10 @@ class SearchService:
                     'name': 'risk_check',
                     'query': (
                         f"{stock_name} 指数走势 跟踪误差 净值 表现"
-                        if is_index_etf else f"{stock_name} 减持 处罚 违规 诉讼 利空 风险"
+                        if is_index_etf else (
+                            f"{stock_name} 减持 处罚 违规 诉讼 利空 风险 "
+                            f"{self._PREFERRED_CN_FINANCE_NEWS_SOURCE_HINT}"
+                        )
                     ),
                     'desc': '风险排查',
                     'tavily_topic': None if is_index_etf else 'news',
@@ -4024,7 +4074,10 @@ class SearchService:
                     'name': 'announcements',
                     'query': (
                         f"{stock_name} {stock_code} 公告 指数调整 成分变化"
-                        if is_index_etf else f"{stock_name} {stock_code} 公司公告 重要公告 上交所 深交所 cninfo"
+                        if is_index_etf else (
+                            f"{stock_name} {stock_code} 公司公告 重要公告 上交所 深交所 cninfo "
+                            f"{self._PREFERRED_CN_FINANCE_NEWS_SOURCE_HINT}"
+                        )
                     ),
                     'desc': '公司公告',
                     'tavily_topic': 'news',
@@ -4034,7 +4087,10 @@ class SearchService:
                     'name': 'earnings',
                     'query': (
                         f"{stock_name} 指数成分 净值 跟踪表现"
-                        if is_index_etf else f"{stock_name} 业绩预告 财报 营收 净利润 同比增长"
+                        if is_index_etf else (
+                            f"{stock_name} 业绩预告 财报 营收 净利润 同比增长 "
+                            f"{self._PREFERRED_CN_FINANCE_NEWS_SOURCE_HINT}"
+                        )
                     ),
                     'desc': '业绩预期',
                     'tavily_topic': None,
