@@ -1,10 +1,10 @@
 name: 每日股票分析
 
-on:
+#on:
   # 定时触发 - 每天北京时间 18:00 (UTC 10:00)
-  schedule:
-    - cron: '0 10 * * 1-5'     # UTC 0:00 = 北京时间 8:00
-      timezone: Asia/Shanghai
+  #schedule:
+    #- cron: '0 10 * * 1-5'     # UTC 0:00 = 北京时间 8:00
+      #timezone: Asia/Shanghai
   
   # 手动触发
   workflow_dispatch:
