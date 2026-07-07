@@ -4062,7 +4062,7 @@ class SearchService:
                     'query': (
                         f"{stock_name} 指数走势 跟踪误差 净值 表现"
                         if is_index_etf else (
-                            f"{stock_name} 减持 处罚 违规 诉讼 利空 风险 "
+                            f"{stock_name} {stock_code} 减持 处罚 违规 诉讼 利空 风险 "  # 修改说明：增加股票代码，提高股票实体识别准确性 20260707
                             f"{self._PREFERRED_CN_FINANCE_NEWS_SOURCE_HINT}"
                         )
                     ),
