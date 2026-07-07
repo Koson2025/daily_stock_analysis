@@ -4050,9 +4050,9 @@ class SearchService:
                     'tavily_topic': 'news',
                     'strict_freshness': True,
                 },
-                {
+                {    
                     'name': 'market_analysis',
-                    'query': f"{stock_name} 研报 目标价 评级 深度分析",
+                    'query': f"{stock_name} {stock_code} 研报 目标价 评级 深度分析", # 修改说明：增加股票代码，提高股票实体识别准确性 20260707
                     'desc': '机构分析',
                     'tavily_topic': None,
                     'strict_freshness': False,
@@ -4088,7 +4088,7 @@ class SearchService:
                     'query': (
                         f"{stock_name} 指数成分 净值 跟踪表现"
                         if is_index_etf else (
-                            f"{stock_name} 业绩预告 财报 营收 净利润 同比增长 "
+                            f"{stock_name} {stock_code} 业绩预告 财报 营收 净利润 同比增长 "  # 增加股票代码，提高证券实体识别准确率 京东方A 000725 避免搜索到京东相关财报 20260707
                             f"{self._PREFERRED_CN_FINANCE_NEWS_SOURCE_HINT}"
                         )
                     ),
@@ -4100,7 +4100,7 @@ class SearchService:
                     'name': 'industry',
                     'query': (
                         f"{stock_name} 指数成分股 行业配置 权重"
-                        if is_index_etf else f"{stock_name} 所在行业 竞争对手 市场份额 行业前景"
+                        if is_index_etf else f"{stock_name} {stock_code} 所在行业 竞争对手 市场份额 行业前景"  #修改说明：增加股票代码，提高股票实体识别准确性 20260707
                     ),
                     'desc': '行业分析',
                     'tavily_topic': None,
