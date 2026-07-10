@@ -783,7 +783,7 @@ class Config:
     # Legacy single-key fields (kept for backward compatibility; gemini_api_keys[0] when set)
     gemini_api_key: Optional[str] = None
     gemini_model: str = "gemini-3.1-pro-preview"  # 主模型
-    gemini_model_fallback: str = "gemini-3-flash-preview"  # 备选模型
+    gemini_model_fallback: str = "gemini-3.5-flash"  # 备选模型 gemini-3-flash-preview 调整 gemini-3.5-flash 20260710
     gemini_temperature: float = 0.7  # 温度参数（0.0-2.0，控制输出随机性，默认0.7）
 
     # Gemini API 请求配置（防止 429 限流）
