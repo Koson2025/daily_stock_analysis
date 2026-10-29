@@ -33,6 +33,15 @@ class ReportLanguageTestCase(unittest.TestCase):
         self.assertEqual(emoji, "🟢")
         self.assertEqual(signal_tag, "buy")
 
+    def test_get_signal_level_score_fallback_uses_canonical_scale(self) -> None:
+        self.assertEqual(get_signal_level("", 28, "zh"), ("减仓", "🟠", "reduce"))
+        self.assertEqual(get_signal_level("", 38, "zh"), ("减仓", "🟠", "reduce"))
+        self.assertEqual(get_signal_level("", 42, "zh"), ("观望", "⚪", "watch"))
+        self.assertEqual(get_signal_level("", 55, "zh"), ("观望", "⚪", "watch"))
+        self.assertEqual(get_signal_level("", 60, "zh"), ("买入", "🟢", "buy"))
+        self.assertEqual(get_signal_level("", 66, "zh"), ("买入", "🟢", "buy"))
+        self.assertEqual(get_signal_level("", 72, "zh"), ("买入", "🟢", "buy"))
+
     def test_get_localized_stock_name_replaces_placeholder_for_english(self) -> None:
         self.assertEqual(
             get_localized_stock_name("股票AAPL", "AAPL", "en"),
@@ -95,9 +104,16 @@ class KoreanReportLanguageTestCase(unittest.TestCase):
     def test_korean_labels_cover_full_english_key_set(self) -> None:
         ko_labels = get_report_labels("ko")
         en_labels = get_report_labels("en")
+        zh_labels = get_report_labels("zh")
         self.assertEqual(set(ko_labels.keys()), set(en_labels.keys()))
+        self.assertEqual(set(zh_labels.keys()), set(en_labels.keys()))
         self.assertEqual(ko_labels["dashboard_title"], "결정 대시보드")
         self.assertEqual(ko_labels["risk_alerts_label"], "리스크 경보")
+
+    def test_data_sources_label_is_localized(self) -> None:
+        self.assertEqual(get_report_labels("zh")["data_sources_label"], "数据来源")
+        self.assertEqual(get_report_labels("en")["data_sources_label"], "Data Sources")
+        self.assertEqual(get_report_labels("ko")["data_sources_label"], "데이터 출처")
 
     def test_korean_sentiment_label_bands(self) -> None:
         self.assertEqual(get_sentiment_label(80, "ko"), "매우 낙관")

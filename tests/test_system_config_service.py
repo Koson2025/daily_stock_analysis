@@ -18,10 +18,10 @@ from tests.litellm_stub import ensure_litellm_stub
 
 ensure_litellm_stub()
 
-from src.config import ANSPIRE_LLM_MODEL_DEFAULT, DEFAULT_ALPHASIFT_INSTALL_SPEC, Config
+from src.config import ANSPIRE_LLM_MODEL_DEFAULT, Config
 from src.core.config_manager import ConfigManager
 from src.llm.backend_registry import GENERATION_ONLY_BACKEND_IDS
-from src.services.system_config_service import ConfigConflictError, ConfigImportError, SystemConfigService
+from src.services.system_config_service import ConfigConflictError, ConfigImportError, ConfigValidationError, SystemConfigService
 
 
 class SystemConfigServiceTestCase(unittest.TestCase):
@@ -57,6 +57,35 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.manager = ConfigManager(env_path=self.env_path)
         self.service = SystemConfigService(manager=self.manager)
 
+    # The regular primary model resolves cleanly; only AGENT_LITELLM_MODEL sits
+    # on a Hermes-only route. Fixtures built from this therefore fail for exactly
+    # one reason, so an assertion about the Agent check cannot be satisfied by an
+    # unrelated primary-model error.
+    _AGENT_ONLY_BROKEN_ENV = (
+        "STOCK_LIST=600519",
+        "AGENT_LITELLM_MODEL=openai/hermes-agent",
+        "LLM_CHANNELS=primary,hermes",
+        "LLM_PRIMARY_PROTOCOL=openai",
+        "LLM_PRIMARY_API_KEY=test-secret",
+        "LLM_PRIMARY_MODELS=gpt-test",
+        "LLM_HERMES_PROTOCOL=openai",
+        "LLM_HERMES_API_KEY=test-secret",
+        "LLM_HERMES_MODELS=hermes-agent",
+        "LITELLM_MODEL=openai/gpt-test",
+    )
+    _AGENT_MODEL_ISSUE_CODE = "explicit_agent_model_no_safe_deployment"
+
+    def _env_with_broken_agent_model_only(self) -> tuple:
+        return self._AGENT_ONLY_BROKEN_ENV
+
+    def _assert_only_agent_model_issue(self, issues=None) -> None:
+        """Assert the only validation problem is the Hermes-only Agent model."""
+        if issues is None:
+            issues = self.service.validate(items=[])["issues"]
+        codes = [issue["code"] for issue in issues]
+        self.assertEqual(codes, [self._AGENT_MODEL_ISSUE_CODE])
+        self.assertEqual(issues[0]["key"], "AGENT_LITELLM_MODEL")
+
     @staticmethod
     def _mock_completion_response(content: str = "OK", tool_calls=None):
         message = SimpleNamespace(content=content, tool_calls=tool_calls or [])
@@ -66,23 +95,93 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         payload = self.service.get_config(include_schema=True)
         items = {item["key"]: item for item in payload["items"]}
 
+        self.assertIn("openai", payload["llm_model_providers"])
+        self.assertIn("xai", payload["llm_model_providers"])
         self.assertIn("GEMINI_API_KEY", items)
         self.assertEqual(items["GEMINI_API_KEY"]["value"], "secret-key-value")
         self.assertFalse(items["GEMINI_API_KEY"]["is_masked"])
         self.assertTrue(items["GEMINI_API_KEY"]["raw_value_exists"])
 
-    def test_get_config_masks_alphasift_install_spec(self) -> None:
+    def _assert_agent_backend_status_matches_runtime(
+        self,
+        *,
+        saved_backend: str,
+        runtime_backend: str,
+    ) -> None:
+        from src.agent.agent_backend import resolve_agent_backend_id
+        from src.services.agent_backend_status_service import AgentBackendStatusService
+
         self._rewrite_env(
-            "STOCK_LIST=600519,000001",
-            "ALPHASIFT_INSTALL_SPEC=git+https://user:token@example.com/internal/alphasift.git",
+            "GEMINI_API_KEY=secret-key-value",
+            f"AGENT_BACKEND={saved_backend}",
+            "AGENT_ARCH=single",
+        )
+        with patch.dict(os.environ, {"AGENT_BACKEND": runtime_backend}):
+            Config.reset_instance()
+            runtime_config = Config.get_instance()
+            with patch.dict(os.environ, {"AGENT_BACKEND": saved_backend}):
+                settings_status = self.service.get_agent_backend_status()
+                chat_status = AgentBackendStatusService(config=runtime_config).get_status()
+                if runtime_backend == "codex_app_server":
+                    with self.assertRaises(ValueError):
+                        resolve_agent_backend_id(runtime_config)
+                else:
+                    self.assertEqual(resolve_agent_backend_id(runtime_config), runtime_backend)
+                preview_baseline = self.service.preview_agent_backend_status(items=[])
+                preview_draft = self.service.preview_agent_backend_status(
+                    items=[{"key": "AGENT_BACKEND", "value": saved_backend}],
+                )
+
+        self.assertEqual(settings_status["backend"], runtime_backend)
+        self.assertEqual(chat_status["backend"], runtime_backend)
+        self.assertEqual(preview_baseline["backend"], runtime_backend)
+        self.assertEqual(preview_draft["backend"], saved_backend)
+        self.assertIs(Config.get_instance(), runtime_config)
+
+    def test_agent_backend_status_prefers_runtime_litellm_over_saved_codex(self) -> None:
+        self._assert_agent_backend_status_matches_runtime(
+            saved_backend="codex_app_server",
+            runtime_backend="litellm",
         )
 
-        payload = self.service.get_config(include_schema=True)
-        items = {item["key"]: item for item in payload["items"]}
+    def test_agent_backend_status_prefers_runtime_codex_over_saved_litellm(self) -> None:
+        self._assert_agent_backend_status_matches_runtime(
+            saved_backend="litellm",
+            runtime_backend="codex_app_server",
+        )
 
-        self.assertEqual(items["ALPHASIFT_INSTALL_SPEC"]["value"], payload["mask_token"])
-        self.assertTrue(items["ALPHASIFT_INSTALL_SPEC"]["is_masked"])
-        self.assertTrue(items["ALPHASIFT_INSTALL_SPEC"]["schema"]["is_sensitive"])
+    def test_agent_backend_empty_preview_uses_runtime_generation_route(self) -> None:
+        from src.services.agent_backend_status_service import AgentBackendStatusService
+
+        self._rewrite_env(
+            "AGENT_BACKEND=litellm",
+            "LITELLM_MODEL=",
+            "OPENAI_API_KEY=",
+        )
+        runtime_env = {
+            "ENV_FILE": str(self.env_path),
+            "AGENT_BACKEND": "litellm",
+            "LITELLM_MODEL": "openai/gpt-4o",
+            "OPENAI_API_KEY": "runtime-key",
+        }
+        with patch.dict(os.environ, runtime_env, clear=True):
+            Config.reset_instance()
+            runtime_config = Config.get_instance()
+            settings_status = self.service.get_agent_backend_status()
+            chat_status = AgentBackendStatusService(config=runtime_config).get_status()
+            preview_baseline = self.service.preview_agent_backend_status(items=[])
+            preview_draft = self.service.preview_agent_backend_status(
+                items=[
+                    {"key": "LITELLM_MODEL", "value": ""},
+                    {"key": "OPENAI_API_KEY", "value": ""},
+                ],
+            )
+
+        self.assertEqual(settings_status, chat_status)
+        self.assertEqual(preview_baseline, chat_status)
+        self.assertTrue(chat_status["available"])
+        self.assertFalse(preview_draft["available"])
+        self.assertEqual(preview_draft["message"], "no_agent_primary")
 
     def test_get_config_masks_hermes_secret_fields(self) -> None:
         self._rewrite_env(
@@ -632,6 +731,16 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.assertEqual(items["REPORT_SHOW_LLM_MODEL"]["value"], "false")
         self.assertTrue(items["REPORT_SHOW_LLM_MODEL"]["raw_value_exists"])
 
+    def test_get_config_defaults_public_searxng_instances_off(self) -> None:
+        payload = self.service.get_config(include_schema=True)
+        items = {item["key"]: item for item in payload["items"]}
+        public_instances = items["SEARXNG_PUBLIC_INSTANCES_ENABLED"]
+
+        self.assertEqual(public_instances["value"], "false")
+        self.assertFalse(public_instances["raw_value_exists"])
+        self.assertEqual(public_instances["schema"]["default_value"], "false")
+        self.assertIn("Default: false", public_instances["schema"]["description"])
+
     def test_get_config_preserves_manual_agent_codex_cli_value_without_schema_option(self) -> None:
         for backend in sorted(GENERATION_ONLY_BACKEND_IDS):
             with self.subTest(backend=backend):
@@ -842,6 +951,236 @@ class SystemConfigServiceTestCase(unittest.TestCase):
             )
         )
 
+    def test_partial_updates_scope_llm_checks_but_routing_changes_still_validate(self) -> None:
+        self._rewrite_env(
+            "STOCK_LIST=600519",
+            "LLM_CHANNELS=primary",
+            "LLM_PRIMARY_PROTOCOL=openai",
+            "LLM_PRIMARY_API_KEY=test-secret",
+            "LLM_PRIMARY_MODELS=gpt-test",
+            "LITELLM_MODEL=openai/gpt-test",
+            "LITELLM_FALLBACK_MODELS=openai/removed-model",
+        )
+        with patch.dict(os.environ, {"ENV_FILE": str(self.env_path)}, clear=True):
+            self.assertFalse(self.service.validate(items=[])["valid"])
+            result = self.service.update(
+                config_version=self.manager.get_config_version(),
+                items=[{"key": "LOG_LEVEL", "value": "DEBUG"}],
+                reload_now=False,
+            )
+            self.assertTrue(result["success"])
+
+            for key, value in [
+                ("LITELLM_MODEL", "openai/gpt-test"),
+                ("LITELLM_FALLBACK_MODELS", "openai/removed-model"),
+                ("AGENT_LITELLM_MODEL", "openai/gpt-test"),
+                ("VISION_MODEL", "openai/gpt-test"),
+                ("LLM_CHANNELS", "primary"),
+                ("LLM_PRIMARY_MODELS", "gpt-test,another-model"),
+                ("LLM_PRIMARY_ENABLED", "false"),
+                ("LLM_PRIMARY_API_KEY", "replacement-test-secret"),
+                ("OPENAI_API_KEY", "legacy-test-secret"),
+                ("LITELLM_CONFIG", ""),
+            ]:
+                with self.subTest(key=key):
+                    before = self.env_path.read_bytes()
+                    with self.assertRaises(ConfigValidationError) as exc:
+                        self.service.update(
+                            config_version=self.manager.get_config_version(),
+                            items=[
+                                {"key": "STOCK_LIST", "value": "AAPL"},
+                                {"key": key, "value": value},
+                            ],
+                            reload_now=False,
+                        )
+                    self.assertTrue(any(
+                        issue["key"] == "LITELLM_FALLBACK_MODELS"
+                        for issue in exc.exception.issues
+                    ))
+                    self.assertEqual(self.env_path.read_bytes(), before)
+
+            result = self.service.update(
+                config_version=self.manager.get_config_version(),
+                items=[{"key": "LITELLM_FALLBACK_MODELS", "value": ""}],
+                reload_now=False,
+            )
+            self.assertTrue(result["success"])
+            self.assertTrue(self.service.validate(items=[])["valid"])
+
+    def test_switching_agent_backend_to_litellm_validates_model_dependencies(self) -> None:
+        """Flipping only the Agent backend must not bypass the model check.
+
+        Ask-stock over LiteLLM resolves its model through the LLM channel
+        graph, so a save that only changes AGENT_BACKEND can activate a model
+        dependency that is already broken -- ask-stock then stops working with
+        no error at save time.
+        """
+        self._rewrite_env(
+            *self._env_with_broken_agent_model_only(),
+            "AGENT_BACKEND=codex_app_server",
+        )
+        with patch.dict(os.environ, {"ENV_FILE": str(self.env_path)}, clear=True):
+            self._assert_only_agent_model_issue()
+
+            before = self.env_path.read_bytes()
+            for key, value in [
+                ("AGENT_BACKEND", "litellm"),
+                ("AGENT_BACKEND", "auto"),
+            ]:
+                with self.subTest(key=key, value=value):
+                    with self.assertRaises(ConfigValidationError) as exc:
+                        self.service.update(
+                            config_version=self.manager.get_config_version(),
+                            items=[{"key": key, "value": value}],
+                            reload_now=False,
+                        )
+                    self._assert_only_agent_model_issue(exc.exception.issues)
+                    self.assertEqual(self.env_path.read_bytes(), before)
+
+    def test_enabling_agent_analysis_validates_model_dependencies(self) -> None:
+        """Turning on Agent analysis must not bypass the model check.
+
+        Regular stock analysis switches to the Agent path on AGENT_MODE, or on
+        AGENT_SKILLS naming something other than "all", and that path builds its
+        own LLMToolAdapter instead of following AGENT_BACKEND. A save that only
+        flips one of those keys can therefore activate a model dependency that is
+        already broken, and every later analysis fails with no error at save time.
+        """
+        self._rewrite_env(
+            *self._env_with_broken_agent_model_only(),
+            "AGENT_MODE=false",
+            "AGENT_SKILLS=",
+        )
+        with patch.dict(os.environ, {"ENV_FILE": str(self.env_path)}, clear=True):
+            self._assert_only_agent_model_issue()
+
+            before = self.env_path.read_bytes()
+            for key, value in [
+                ("AGENT_MODE", "true"),
+                ("AGENT_SKILLS", "bull_trend"),
+                ("AGENT_SKILLS", "bull_trend,risk_control"),
+            ]:
+                with self.subTest(key=key, value=value):
+                    with self.assertRaises(ConfigValidationError) as exc:
+                        self.service.update(
+                            config_version=self.manager.get_config_version(),
+                            items=[{"key": key, "value": value}],
+                            reload_now=False,
+                        )
+                    self._assert_only_agent_model_issue(exc.exception.issues)
+                    self.assertEqual(self.env_path.read_bytes(), before)
+
+    def test_agent_analysis_keys_that_do_not_activate_stay_exempt(self) -> None:
+        """The gate must agree with what the pipeline will actually do.
+
+        AGENT_SKILLS=all keeps the regular analysis path, an empty value means no
+        skills, and AGENT_MODE=false is an explicit opt-out -- none of them turn
+        the Agent on, so a broken Agent model must not block them. The regular
+        primary model is valid here, so a successful save can only mean the Agent
+        check was skipped.
+        """
+        self._rewrite_env(
+            *self._env_with_broken_agent_model_only(),
+            "AGENT_MODE=false",
+            "AGENT_SKILLS=",
+        )
+        with patch.dict(os.environ, {"ENV_FILE": str(self.env_path)}, clear=True):
+            self._assert_only_agent_model_issue()
+            for key, value in [
+                ("AGENT_SKILLS", "all"),
+                ("AGENT_SKILLS", ""),
+                ("AGENT_MODE", "false"),
+            ]:
+                with self.subTest(key=key, value=value):
+                    result = self.service.update(
+                        config_version=self.manager.get_config_version(),
+                        items=[{"key": key, "value": value}],
+                        reload_now=False,
+                    )
+                    self.assertTrue(result["success"])
+
+    def test_switching_agent_generation_backend_validates_when_chat_uses_litellm(self) -> None:
+        """AGENT_GENERATION_BACKEND only routes through the graph when chat does.
+
+        An existing retired AGENT_BACKEND remains unchanged in the second case;
+        updating generation alone does not reactivate the LiteLLM chat path.
+        """
+        base = self._env_with_broken_agent_model_only()
+        self._rewrite_env(*base, "AGENT_BACKEND=litellm", "AGENT_GENERATION_BACKEND=codex_cli")
+        with patch.dict(os.environ, {"ENV_FILE": str(self.env_path)}, clear=True):
+            with self.assertRaises(ConfigValidationError) as exc:
+                self.service.update(
+                    config_version=self.manager.get_config_version(),
+                    items=[{"key": "AGENT_GENERATION_BACKEND", "value": "litellm"}],
+                    reload_now=False,
+                )
+            self._assert_only_agent_model_issue(exc.exception.issues)
+
+        self._rewrite_env(*base, "AGENT_BACKEND=codex_app_server", "AGENT_GENERATION_BACKEND=codex_cli")
+        with patch.dict(os.environ, {"ENV_FILE": str(self.env_path)}, clear=True):
+            result = self.service.update(
+                config_version=self.manager.get_config_version(),
+                items=[{"key": "AGENT_GENERATION_BACKEND", "value": "litellm"}],
+                reload_now=False,
+            )
+
+        self.assertTrue(result["success"])
+
+    def test_retired_backend_still_rejected_with_unrelated_agent_model_error(self) -> None:
+        """Scoped LLM checks must not bypass retired-backend field validation."""
+        self._rewrite_env(
+            *self._env_with_broken_agent_model_only(),
+            "AGENT_BACKEND=litellm",
+        )
+        with patch.dict(os.environ, {"ENV_FILE": str(self.env_path)}, clear=True):
+            self._assert_only_agent_model_issue()
+            for operation in ("save", "import"):
+                with self.subTest(operation=operation):
+                    before = self.env_path.read_bytes()
+                    version = self.manager.get_config_version()
+                    with self.assertRaises(ConfigValidationError) as exc:
+                        if operation == "save":
+                            self.service.update(
+                                config_version=version,
+                                items=[
+                                    {"key": "AGENT_BACKEND", "value": "codex_app_server"},
+                                    {"key": "LOG_LEVEL", "value": "DEBUG"},
+                                ],
+                                reload_now=False,
+                            )
+                        else:
+                            self.service.import_env(
+                                config_version=version,
+                                content="AGENT_BACKEND=codex_app_server\nLOG_LEVEL=DEBUG\n",
+                                reload_now=False,
+                            )
+                    self.assertTrue(any(
+                        issue["code"] == "backend_removed" and issue["key"] == "AGENT_BACKEND"
+                        for issue in exc.exception.issues
+                    ))
+                    self.assertEqual(self.env_path.read_bytes(), before)
+                    self.assertEqual(self.manager.get_config_version(), version)
+
+    def test_unrelated_partial_update_still_skips_llm_checks(self) -> None:
+        """The original bug stays fixed: unrelated saves are not blocked.
+
+        Both the Agent model and a fallback model are broken here, so a
+        successful save proves neither check ran.
+        """
+        self._rewrite_env(
+            *self._env_with_broken_agent_model_only(),
+            "AGENT_BACKEND=codex_app_server",
+            "LITELLM_FALLBACK_MODELS=openai/removed-model",
+        )
+        with patch.dict(os.environ, {"ENV_FILE": str(self.env_path)}, clear=True):
+            result = self.service.update(
+                config_version=self.manager.get_config_version(),
+                items=[{"key": "LOG_LEVEL", "value": "DEBUG"}],
+                reload_now=False,
+            )
+
+        self.assertTrue(result["success"])
+
     def test_get_config_switch_type_uses_runtime_env_display_fallback(self) -> None:
         self._rewrite_env(
             "STOCK_LIST=600519",
@@ -947,6 +1286,216 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.assertEqual(checks["llm_agent"]["status"], "inherited")
         self.assertEqual(checks["stock_list"]["status"], "configured")
         self.assertEqual(checks["notification"]["status"], "optional")
+
+    def test_generation_backend_status_preview_uses_draft_backend(self) -> None:
+        self._rewrite_env(
+            "GENERATION_BACKEND=litellm",
+            "LITELLM_MODEL=gemini/gemini-3-flash-preview",
+            "GEMINI_API_KEY=secret-key-value",
+        )
+
+        with patch("src.llm.local_cli_backend.shutil.which", return_value=None):
+            payload = self.service.preview_generation_backend_status(
+                items=[
+                    {"key": "GENERATION_BACKEND", "value": "codex_cli"},
+                    {"key": "GENERATION_FALLBACK_BACKEND", "value": ""},
+                ],
+                mask_token="******",
+            )
+
+        self.assertEqual(payload["primary_backend_id"], "codex_cli")
+        self.assertFalse(payload["primary"]["available"])
+        self.assertEqual(payload["primary"]["health_status"], "failed")
+        self.assertEqual(payload["primary"]["last_error_code"], "command_not_found")
+
+    def test_generation_backend_status_preserves_masked_saved_secret(self) -> None:
+        self._rewrite_env(
+            "GENERATION_BACKEND=litellm",
+            "LITELLM_MODEL=gemini/gemini-3-flash-preview",
+            "GEMINI_API_KEY=saved-secret-value",
+        )
+
+        payload = self.service.preview_generation_backend_status(
+            items=[{"key": "GEMINI_API_KEY", "value": "******"}],
+            mask_token="******",
+        )
+
+        self.assertEqual(payload["primary_backend_id"], "litellm")
+        self.assertTrue(payload["primary"]["available"])
+
+    def test_generation_backend_status_saved_invalid_numeric_returns_failed_status(self) -> None:
+        self._rewrite_env(
+            "GENERATION_BACKEND=codex_cli",
+            "GENERATION_FALLBACK_BACKEND=",
+            "GENERATION_BACKEND_TIMEOUT_SECONDS=not-int",
+        )
+
+        payload = self.service.get_generation_backend_status()
+
+        self.assertEqual(payload["primary_backend_id"], "codex_cli")
+        self.assertFalse(payload["primary"]["available"])
+        self.assertEqual(payload["primary"]["health_status"], "failed")
+        self.assertEqual(payload["primary"]["last_error_code"], "unsafe_config")
+
+    def test_generation_backend_preview_invalid_numeric_returns_validation_error(self) -> None:
+        self._rewrite_env(
+            "GENERATION_BACKEND=codex_cli",
+            "GENERATION_FALLBACK_BACKEND=",
+        )
+
+        with self.assertRaises(ConfigValidationError) as ctx:
+            self.service.preview_generation_backend_status(
+                items=[{"key": "GENERATION_BACKEND_TIMEOUT_SECONDS", "value": "not-int"}],
+                mask_token="******",
+            )
+
+        self.assertEqual(ctx.exception.issues[0]["key"], "GENERATION_BACKEND_TIMEOUT_SECONDS")
+        self.assertEqual(ctx.exception.issues[0]["severity"], "error")
+
+    def test_generation_backend_status_saved_litellm_invalid_channel_returns_failed_status(self) -> None:
+        self._rewrite_env(
+            "GENERATION_BACKEND=litellm",
+            "LLM_CHANNELS=remote",
+            "LLM_REMOTE_PROTOCOL=openai",
+            "LLM_REMOTE_BASE_URL=http://169.254.169.254/v1",
+            "LLM_REMOTE_API_KEY=sk-remote",
+            "LLM_REMOTE_MODELS=gpt-4o-mini",
+        )
+
+        payload = self.service.get_generation_backend_status()
+
+        self.assertEqual(payload["primary_backend_id"], "litellm")
+        self.assertFalse(payload["primary"]["available"])
+        self.assertEqual(payload["primary"]["health_status"], "failed")
+        self.assertEqual(payload["primary"]["last_error_code"], "unsafe_config")
+
+    def test_generation_backend_status_saved_litellm_model_without_key_returns_failed_status(self) -> None:
+        self._rewrite_env(
+            "GENERATION_BACKEND=litellm",
+            "LITELLM_MODEL=gemini/gemini-3-flash-preview",
+        )
+
+        with patch.dict(os.environ, {"ENV_FILE": str(self.env_path)}, clear=True):
+            payload = self.service.get_generation_backend_status()
+
+        self.assertEqual(payload["primary_backend_id"], "litellm")
+        self.assertFalse(payload["primary"]["available"])
+        self.assertEqual(payload["primary"]["health_status"], "failed")
+        self.assertEqual(payload["primary"]["last_error_code"], "unsafe_config")
+
+    def test_generation_backend_preview_litellm_model_without_key_returns_validation_error(self) -> None:
+        self._rewrite_env("GENERATION_BACKEND=litellm")
+
+        with patch.dict(os.environ, {"ENV_FILE": str(self.env_path)}, clear=True):
+            with self.assertRaises(ConfigValidationError) as ctx:
+                self.service.preview_generation_backend_status(
+                    items=[{"key": "LITELLM_MODEL", "value": "gemini/gemini-3-flash-preview"}],
+                    mask_token="******",
+                )
+
+        self.assertEqual(ctx.exception.issues[0]["key"], "LITELLM_MODEL")
+        self.assertEqual(ctx.exception.issues[0]["code"], "missing_runtime_source")
+
+    def test_generation_backend_preview_uses_openai_model_draft(self) -> None:
+        self._rewrite_env(
+            "GENERATION_BACKEND=litellm",
+            "OPENAI_API_KEY=secret-key-value",
+            "OPENAI_MODEL=gpt-5.5",
+        )
+
+        with patch.dict(os.environ, {"ENV_FILE": str(self.env_path)}, clear=True):
+            payload = self.service.preview_generation_backend_status(
+                items=[{"key": "OPENAI_MODEL", "value": "gemini/gemini-3-flash-preview"}],
+                mask_token="******",
+            )
+
+        self.assertEqual(payload["primary_backend_id"], "litellm")
+        self.assertFalse(payload["primary"]["available"])
+        self.assertEqual(payload["primary"]["last_error_code"], "unsafe_config")
+
+    def test_generation_backend_preview_uses_gemini_model_draft(self) -> None:
+        self._rewrite_env(
+            "GENERATION_BACKEND=litellm",
+            "GEMINI_API_KEY=secret-key-value",
+            "GEMINI_MODEL=gemini-3.1-pro-preview",
+        )
+
+        with patch.dict(os.environ, {"ENV_FILE": str(self.env_path)}, clear=True):
+            payload = self.service.preview_generation_backend_status(
+                items=[{"key": "GEMINI_MODEL", "value": "openai/gpt-5.5"}],
+                mask_token="******",
+            )
+
+        self.assertEqual(payload["primary_backend_id"], "litellm")
+        self.assertFalse(payload["primary"]["available"])
+        self.assertEqual(payload["primary"]["last_error_code"], "unsafe_config")
+
+    def test_generation_backend_status_uses_runtime_provider_key_fallback(self) -> None:
+        self._rewrite_env(
+            "GENERATION_BACKEND=litellm",
+            "LITELLM_MODEL=gemini/gemini-3-flash-preview",
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "ENV_FILE": str(self.env_path),
+                "GEMINI_API_KEY": "runtime-secret-value",
+            },
+            clear=True,
+        ):
+            payload = self.service.get_generation_backend_status()
+
+        self.assertEqual(payload["primary_backend_id"], "litellm")
+        self.assertTrue(payload["primary"]["available"])
+        self.assertIsNone(payload["primary"]["last_error_code"])
+
+    def test_generation_backend_preview_local_cli_ignores_inactive_litellm_model_error(self) -> None:
+        self._rewrite_env(
+            "GENERATION_BACKEND=litellm",
+            "LITELLM_MODEL=gemini/gemini-3-flash-preview",
+        )
+
+        with patch("src.llm.local_cli_backend.shutil.which", return_value=None):
+            payload = self.service.preview_generation_backend_status(
+                items=[
+                    {"key": "GENERATION_BACKEND", "value": "codex_cli"},
+                    {"key": "GENERATION_FALLBACK_BACKEND", "value": ""},
+                ],
+                mask_token="******",
+            )
+
+        self.assertEqual(payload["primary_backend_id"], "codex_cli")
+        self.assertEqual(payload["primary"]["last_error_code"], "command_not_found")
+
+    def test_generation_backend_preview_ignores_unrelated_draft_errors(self) -> None:
+        self._rewrite_env(
+            "GENERATION_BACKEND=litellm",
+            "LITELLM_MODEL=gemini/gemini-3-flash-preview",
+            "GEMINI_API_KEY=secret-key-value",
+        )
+
+        payload = self.service.preview_generation_backend_status(
+            items=[{"key": "WECHAT_WEBHOOK_URL", "value": "not-a-url"}],
+            mask_token="******",
+        )
+
+        self.assertEqual(payload["primary_backend_id"], "litellm")
+        self.assertTrue(payload["primary"]["available"])
+
+    def test_generation_backend_status_fallback_error_does_not_fail_primary(self) -> None:
+        self._rewrite_env(
+            "GENERATION_BACKEND=codex_cli",
+            "GENERATION_FALLBACK_BACKEND=bad_backend",
+        )
+
+        with patch("src.llm.local_cli_backend.shutil.which", return_value="/usr/bin/codex"), \
+             patch("src.llm.local_cli_backend.os.access", return_value=True):
+            payload = self.service.get_generation_backend_status()
+
+        self.assertTrue(payload["primary"]["available"])
+        self.assertEqual(payload["fallback"]["backend_id"], "bad_backend")
+        self.assertFalse(payload["fallback"]["available"])
 
     def test_get_setup_status_treats_codex_cli_as_primary_runtime_without_api_keys(self) -> None:
         self._rewrite_env(
@@ -1486,7 +2035,7 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.assertEqual(current_map["STOCK_LIST"], "600519,300750")
         self.assertEqual(current_map["GEMINI_API_KEY"], "secret-key-value")
 
-    def test_update_alphasift_enable_does_not_rewrite_llm_fields(self) -> None:
+    def test_update_builtin_screening_enable_does_not_rewrite_llm_fields(self) -> None:
         self._rewrite_env(
             "STOCK_LIST=600519,000001",
             "LITELLM_MODEL=openai/gpt-4o-mini",
@@ -1498,8 +2047,7 @@ class SystemConfigServiceTestCase(unittest.TestCase):
             "LLM_OPENAI_API_KEYS=legacy-openai-secret",
             "LLM_OPENAI_MODELS=openai/gpt-4o-mini,openai/gpt-4o",
             "LITELLM_FALLBACK_MODELS=openai/gpt-4o-mini,openai/gpt-4o",
-            "ALPHASIFT_ENABLED=false",
-            f"ALPHASIFT_INSTALL_SPEC={DEFAULT_ALPHASIFT_INSTALL_SPEC}",
+            "SCREENING_ENABLED=false",
             "LLM_USAGE_HMAC_SECRET=telemetry-secret",
             "LLM_USAGE_HMAC_KEY_VERSION=test-v1",
             "GEMINI_API_KEY=legacy-secret",
@@ -1508,8 +2056,7 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         response = self.service.update(
             config_version=self.manager.get_config_version(),
             items=[
-                {"key": "ALPHASIFT_ENABLED", "value": "true"},
-                {"key": "ALPHASIFT_INSTALL_SPEC", "value": "******"},
+                {"key": "SCREENING_ENABLED", "value": "true"},
                 {"key": "LLM_USAGE_HMAC_SECRET", "value": "******"},
                 {"key": "GEMINI_API_KEY", "value": "******"},
             ],
@@ -1519,15 +2066,11 @@ class SystemConfigServiceTestCase(unittest.TestCase):
 
         self.assertTrue(response["success"])
         self.assertEqual(response["applied_count"], 1)
-        self.assertIn("ALPHASIFT_ENABLED", response["updated_keys"])
-        self.assertEqual(response["skipped_masked_count"], 3)
+        self.assertIn("SCREENING_ENABLED", response["updated_keys"])
+        self.assertEqual(response["skipped_masked_count"], 2)
 
         current_map = self.manager.read_config_map()
-        self.assertEqual(current_map["ALPHASIFT_ENABLED"], "true")
-        self.assertEqual(
-            current_map["ALPHASIFT_INSTALL_SPEC"],
-            DEFAULT_ALPHASIFT_INSTALL_SPEC,
-        )
+        self.assertEqual(current_map["SCREENING_ENABLED"], "true")
         self.assertEqual(current_map["LLM_USAGE_HMAC_SECRET"], "telemetry-secret")
         self.assertEqual(current_map["LLM_USAGE_HMAC_KEY_VERSION"], "test-v1")
         self.assertEqual(current_map["GEMINI_API_KEY"], "legacy-secret")
@@ -1750,6 +2293,146 @@ class SystemConfigServiceTestCase(unittest.TestCase):
 
         self.assertFalse(validation["valid"])
         self.assertTrue(any(issue["code"] == "missing_api_key" for issue in validation["issues"]))
+
+    def test_validate_rejects_unknown_llm_api_surface(self) -> None:
+        validation = self.service.validate(
+            items=[
+                {"key": "LLM_CHANNELS", "value": "primary"},
+                {"key": "LLM_PRIMARY_PROTOCOL", "value": "openai"},
+                {"key": "LLM_PRIMARY_API_SURFACE", "value": "automatic"},
+                {"key": "LLM_PRIMARY_API_KEY", "value": "sk-test-value"},
+                {"key": "LLM_PRIMARY_MODELS", "value": "gpt-4o-mini"},
+            ]
+        )
+
+        self.assertFalse(validation["valid"])
+        self.assertTrue(any(issue["code"] == "invalid_api_surface" for issue in validation["issues"]))
+
+    def test_validate_rejects_unknown_anspire_llm_api_surface(self) -> None:
+        validation = self.service.validate(
+            items=[
+                {"key": "LLM_CHANNELS", "value": "anspire"},
+                {"key": "LLM_ANSPIRE_API_SURFACE", "value": "respones"},
+                {"key": "ANSPIRE_API_KEYS", "value": "sk-anspire-test-value"},
+            ]
+        )
+
+        self.assertFalse(validation["valid"])
+        self.assertTrue(
+            any(
+                issue["key"] == "LLM_ANSPIRE_API_SURFACE"
+                and issue["code"] == "invalid_api_surface"
+                for issue in validation["issues"]
+            )
+        )
+
+    def test_validate_requires_openai_protocol_for_responses_surface(self) -> None:
+        validation = self.service.validate(
+            items=[
+                {"key": "LLM_CHANNELS", "value": "primary"},
+                {"key": "LLM_PRIMARY_PROTOCOL", "value": "deepseek"},
+                {"key": "LLM_PRIMARY_API_SURFACE", "value": "responses"},
+                {"key": "LLM_PRIMARY_API_KEY", "value": "sk-test-value"},
+                {"key": "LLM_PRIMARY_MODELS", "value": "deepseek-v4-flash"},
+            ]
+        )
+
+        self.assertFalse(validation["valid"])
+        self.assertTrue(
+            any(issue["code"] == "responses_requires_openai_protocol" for issue in validation["issues"])
+        )
+
+    def test_validate_rejects_non_openai_model_provider_for_responses_surface(self) -> None:
+        validation = self.service.validate(
+            items=[
+                {"key": "LLM_CHANNELS", "value": "primary"},
+                {"key": "LLM_PRIMARY_PROTOCOL", "value": "openai"},
+                {"key": "LLM_PRIMARY_API_SURFACE", "value": "responses"},
+                {"key": "LLM_PRIMARY_API_KEY", "value": "sk-test-value"},
+                {"key": "LLM_PRIMARY_MODELS", "value": "anthropic/claude-sonnet-4-6"},
+            ]
+        )
+
+        self.assertFalse(validation["valid"])
+        self.assertTrue(
+            any(
+                issue["key"] == "LLM_PRIMARY_MODELS"
+                and issue["code"] == "responses_requires_openai_model_provider"
+                for issue in validation["issues"]
+            )
+        )
+
+    def test_validate_rejects_litellm_direct_provider_for_responses_surface(self) -> None:
+        validation = self.service.validate(
+            items=[
+                {"key": "LLM_CHANNELS", "value": "primary"},
+                {"key": "LLM_PRIMARY_PROTOCOL", "value": "openai"},
+                {"key": "LLM_PRIMARY_API_SURFACE", "value": "responses"},
+                {"key": "LLM_PRIMARY_API_KEY", "value": "sk-test-value"},
+                {"key": "LLM_PRIMARY_MODELS", "value": "xai/grok-beta"},
+            ]
+        )
+
+        self.assertFalse(validation["valid"])
+        self.assertTrue(
+            any(
+                issue["key"] == "LLM_PRIMARY_MODELS"
+                and issue["code"] == "responses_requires_openai_model_provider"
+                for issue in validation["issues"]
+            )
+        )
+
+    def test_validate_rejects_duplicate_route_alias_with_mixed_surfaces(self) -> None:
+        validation = self.service.validate(
+            items=[
+                {"key": "LLM_CHANNELS", "value": "chat,responses"},
+                {"key": "LLM_CHAT_PROTOCOL", "value": "openai"},
+                {"key": "LLM_CHAT_API_KEY", "value": "sk-chat"},
+                {"key": "LLM_CHAT_MODELS", "value": "gpt-5.6-sol"},
+                {"key": "LLM_RESPONSES_PROTOCOL", "value": "openai"},
+                {"key": "LLM_RESPONSES_API_SURFACE", "value": "responses"},
+                {"key": "LLM_RESPONSES_API_KEY", "value": "sk-responses"},
+                {"key": "LLM_RESPONSES_MODELS", "value": "gpt-5.6-sol"},
+            ]
+        )
+
+        self.assertFalse(validation["valid"])
+        self.assertTrue(
+            any(
+                issue["key"] == "LLM_CHANNELS"
+                and issue["code"] == "mixed_api_surfaces_for_route"
+                and "openai/gpt-5.6-sol" in issue["message"]
+                for issue in validation["issues"]
+            )
+        )
+
+    def test_validate_rejects_responses_surface_for_hermes_channel(self) -> None:
+        validation = self.service.validate(
+            items=[
+                {"key": "LLM_CHANNELS", "value": "hermes"},
+                {"key": "LLM_HERMES_API_SURFACE", "value": "responses"},
+                {"key": "LLM_HERMES_API_KEY", "value": "sk-test-value"},
+            ]
+        )
+
+        self.assertFalse(validation["valid"])
+        self.assertTrue(
+            any(issue["code"] == "hermes_responses_unsupported" for issue in validation["issues"])
+        )
+
+    def test_validate_skips_stale_responses_surface_for_disabled_hermes_channel(self) -> None:
+        validation = self.service.validate(
+            items=[
+                {"key": "LLM_CHANNELS", "value": "hermes"},
+                {"key": "LLM_HERMES_ENABLED", "value": "false"},
+                {"key": "LLM_HERMES_API_SURFACE", "value": "responses"},
+            ]
+        )
+
+        self.assertTrue(validation["valid"], validation["issues"])
+        self.assertFalse(
+            any(issue["key"] == "LLM_HERMES_API_SURFACE" for issue in validation["issues"])
+        )
 
     def test_validate_preserves_model_based_protocol_inference_for_ollama_channel(self) -> None:
         validation = self.service.validate(
@@ -2085,6 +2768,82 @@ class SystemConfigServiceTestCase(unittest.TestCase):
 
         self.assertFalse(validation["valid"])
         self.assertTrue(any(issue["code"] == "invalid_enum" for issue in validation["issues"]))
+
+    def test_retired_config_is_readable_exportable_and_unrelated_saves_work(self) -> None:
+        self._rewrite_env("AGENT_BACKEND=codex_app_server", "AGENT_ARCH=multi", "LOG_LEVEL=INFO")
+        with patch.dict(os.environ, {"AGENT_BACKEND": "codex_app_server"}):
+            payload = self.service.get_config(include_schema=True)
+            item = next(item for item in payload["items"] if item["key"] == "AGENT_BACKEND")
+            self.assertEqual(item["value"], "codex_app_server")
+            self.assertEqual(item["schema"]["validation"]["enum"], ["auto", "litellm"])
+            self.assertIn("AGENT_BACKEND=codex_app_server", self.service.export_env()["content"])
+            self.service.update(config_version=self.manager.get_config_version(),
+                                items=[{"key": "LOG_LEVEL", "value": "DEBUG"}], reload_now=False)
+        self.assertEqual(self.manager.read_config_map()["AGENT_BACKEND"], "codex_app_server")
+        self.assertEqual(self.manager.read_config_map()["LOG_LEVEL"], "DEBUG")
+
+    def test_explicit_retired_save_and_import_are_atomic_then_user_can_correct(self) -> None:
+        self._rewrite_env("AGENT_BACKEND=codex_app_server", "LOG_LEVEL=INFO")
+        for operation in ("save", "import"):
+            with self.subTest(operation=operation):
+                before = self.env_path.read_text()
+                version = self.manager.get_config_version()
+                with self.assertRaises(ConfigValidationError) as error:
+                    if operation == "save":
+                        self.service.update(config_version=version, reload_now=False, items=[
+                            {"key": "AGENT_BACKEND", "value": " CODEX_APP_SERVER "},
+                            {"key": "LOG_LEVEL", "value": "DEBUG"},
+                        ])
+                    else:
+                        self.service.import_env(config_version=version, reload_now=False,
+                                                content="AGENT_BACKEND=codex_app_server\nLOG_LEVEL=DEBUG\n")
+                self.assertTrue(any(i["code"] == "backend_removed" and i["key"] == "AGENT_BACKEND"
+                                    for i in error.exception.issues))
+                self.assertEqual(self.env_path.read_text(), before)
+                self.assertEqual(self.manager.get_config_version(), version)
+        for value in ("auto", "litellm"):
+            self.service.update(config_version=self.manager.get_config_version(), reload_now=False,
+                                items=[{"key": "AGENT_BACKEND", "value": value}])
+            self.assertEqual(self.manager.read_config_map()["AGENT_BACKEND"], value)
+            self.assertNotEqual(self.manager.get_config_version(), version)
+        self.assertEqual(self.manager.read_config_map()["LOG_LEVEL"], "INFO")
+
+    def test_validate_rejects_codex_backend_with_multi_agent_architecture(self) -> None:
+        validation = self.service.validate(
+            items=[
+                {"key": "AGENT_BACKEND", "value": "codex_app_server"},
+                {"key": "AGENT_ARCH", "value": "multi"},
+            ]
+        )
+
+        self.assertFalse(validation["valid"])
+        issue = next(
+            issue
+            for issue in validation["issues"]
+            if issue["code"] == "backend_removed"
+        )
+        self.assertEqual(issue["key"], "AGENT_BACKEND")
+        self.assertEqual(issue["expected"], "auto or litellm")
+
+    def test_validate_rejects_disabled_timeout_for_codex_only(self) -> None:
+        codex = self.service.validate(
+            items=[
+                {"key": "AGENT_BACKEND", "value": "codex_app_server"},
+                {"key": "AGENT_ORCHESTRATOR_TIMEOUT_S", "value": "0"},
+            ]
+        )
+        litellm = self.service.validate(
+            items=[
+                {"key": "AGENT_BACKEND", "value": "litellm"},
+                {"key": "AGENT_ORCHESTRATOR_TIMEOUT_S", "value": "0"},
+            ]
+        )
+
+        self.assertFalse(codex["valid"])
+        self.assertTrue(
+            any(issue["code"] == "backend_removed" for issue in codex["issues"])
+        )
+        self.assertTrue(litellm["valid"])
 
     def test_validate_reports_generation_backend_numeric_maximum(self) -> None:
         validation = self.service.validate(
@@ -2429,6 +3188,96 @@ class SystemConfigServiceTestCase(unittest.TestCase):
 
         self.assertTrue(validation["valid"])
         self.assertEqual(validation["issues"], [])
+
+    def test_minimal_modelflare_config_is_valid_and_ready_without_persisting_defaults(self) -> None:
+        self._rewrite_env(
+            "MODELFLARE_KEY=sk-test",
+            "STOCK_LIST=600519",
+        )
+        before = self.env_path.read_text(encoding="utf-8")
+        with patch.dict(os.environ, {}, clear=True):
+            validation = self.service.validate(items=[])
+            status = self.service.get_setup_status()
+            models = self.service._collect_llm_channel_models_from_map(self.manager.read_config_map())
+            self.assertTrue(self.service.preview_generation_backend_status(items=[])["primary"]["available"])
+            item = next(item for item in self.service.get_config()["items"] if item["key"] == "MODELFLARE_KEY")
+            self.assertTrue(item["schema"]["is_sensitive"])
+        self.assertTrue(validation["valid"], validation["issues"])
+        self.assertTrue(status["is_complete"])
+        self.assertEqual(models, ["openai/gpt-6.1-sol"])
+        self.assertEqual(self.env_path.read_text(encoding="utf-8"), before)
+
+    def test_modelflare_one_key_runtime_display_and_draft_validation_do_not_persist(self) -> None:
+        self._rewrite_env("STOCK_LIST=600519")
+        before = self.env_path.read_text(encoding="utf-8")
+        with patch.dict(os.environ, {"MODELFLARE_KEY": "sk-test"}, clear=True):
+            config = self.service.get_config()
+            items = {item["key"]: item for item in config["items"]}
+            self.assertEqual(items["MODELFLARE_KEY"]["value"], "sk-test")
+            self.assertFalse(items["MODELFLARE_KEY"]["raw_value_exists"])
+            self.assertTrue(items["MODELFLARE_KEY"]["schema"]["is_sensitive"])
+            self.assertTrue(self.service.preview_generation_backend_status(items=[])["primary"]["available"])
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(self.service.validate(items=[{"key": "MODELFLARE_KEY", "value": "sk-draft"}])["valid"])
+            self.assertTrue(self.service.preview_generation_backend_status(
+                items=[{"key": "MODELFLARE_KEY", "value": "sk-draft"}],
+            )["primary"]["available"])
+        self.assertEqual(self.env_path.read_text(encoding="utf-8"), before)
+
+    @patch("litellm.completion")
+    def test_modelflare_existing_primary_model_supports_validation_preview_and_connection(self, completion) -> None:
+        self._rewrite_env(
+            "LLM_CHANNELS=modelflare", "LLM_MODELFLARE_API_KEY=sk-test",
+            "LITELLM_MODEL=openai/account-model", "LITELLM_FALLBACK_MODELS=openai/fallback-model",
+            "STOCK_LIST=600519",
+        )
+        before = self.env_path.read_text(encoding="utf-8")
+        completion.return_value = self._mock_completion_response()
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(self.service.validate(items=[])["valid"])
+            self.assertTrue(self.service.get_setup_status()["is_complete"])
+            self.assertTrue(self.service.preview_generation_backend_status(items=[])["primary"]["available"])
+            invalid = self.service.validate(items=[
+                {"key": "LITELLM_FALLBACK_MODELS", "value": "deepseek/other-model"},
+            ])
+            self.assertFalse(invalid["valid"])
+            self.assertTrue(any(issue["code"] == "unknown_model" for issue in invalid["issues"]))
+            result = self.service.test_llm_channel(
+                name="modelflare", protocol="openai", base_url="", api_key="sk-test", models=[],
+            )
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["resolved_model"], "openai/account-model")
+        self.assertEqual(completion.call_args.kwargs["api_base"], "https://modelflare.dev/v1")
+        self.assertEqual(self.env_path.read_text(encoding="utf-8"), before)
+
+    @patch("litellm.completion")
+    @patch("src.services.system_config_service.requests.get")
+    def test_modelflare_discovery_and_connection_apply_default_endpoint(self, get, completion) -> None:
+        get.return_value = SimpleNamespace(
+            ok=True, status_code=200, json=lambda: {"data": [{"id": "account-model"}]},
+        )
+        completion.return_value = self._mock_completion_response()
+        for base_url in ("", "https://custom.example/v1"):
+            with self.subTest(base_url=base_url):
+                request = dict(name="modelflare", protocol="", base_url=base_url,
+                               api_key="sk-test", models=["account-model"])
+                discovery = self.service.discover_llm_channel_models(**request)
+                connection = self.service.test_llm_channel(**request)
+                expected = base_url or "https://modelflare.dev/v1"
+                self.assertTrue(discovery["success"], discovery)
+                self.assertTrue(connection["success"], connection)
+                self.assertEqual(get.call_args.args[0], expected + "/models")
+                self.assertEqual(completion.call_args.kwargs["api_base"], expected)
+
+    @patch("litellm.completion")
+    @patch("src.services.system_config_service.requests.get")
+    def test_modelflare_explicit_invalid_endpoint_is_not_replaced(self, get, completion) -> None:
+        request = dict(name="modelflare", protocol="", base_url="http://169.254.169.254/v1",
+                       api_key="sk-test", models=["account-model"])
+        self.assertFalse(self.service.discover_llm_channel_models(**request)["success"])
+        self.assertFalse(self.service.test_llm_channel(**request)["success"])
+        get.assert_not_called()
+        completion.assert_not_called()
 
     def test_validate_treats_blank_anspire_channel_enabled_as_shared_disable(self) -> None:
         validation = self.service.validate(
@@ -3103,6 +3952,50 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.assertNotIn("temperature", mock_completion.call_args_list[1].kwargs)
 
     @patch("litellm.completion")
+    def test_test_llm_channel_routes_responses_surface_through_litellm_bridge(
+        self,
+        mock_completion,
+    ) -> None:
+        mock_completion.return_value = self._mock_completion_response("OK")
+
+        payload = self.service.test_llm_channel(
+            name="anspire",
+            protocol="openai",
+            api_surface="responses",
+            base_url="https://open-gateway.anspire.cn/v6",
+            api_key="sk-test-value",
+            models=["gpt-5.6-sol"],
+        )
+
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["stage"], "responses")
+        self.assertEqual(payload["resolved_api_surface"], "responses")
+        self.assertEqual(payload["resolved_model"], "openai/gpt-5.6-sol")
+        self.assertEqual(
+            mock_completion.call_args.kwargs["model"],
+            "openai/responses/gpt-5.6-sol",
+        )
+
+    @patch("litellm.completion")
+    def test_test_llm_channel_rejects_non_openai_model_before_network_call(
+        self,
+        mock_completion,
+    ) -> None:
+        payload = self.service.test_llm_channel(
+            name="primary",
+            protocol="openai",
+            api_surface="responses",
+            base_url="https://api.example.com/v1",
+            api_key="sk-test-value",
+            models=["anthropic/claude-sonnet-4-6"],
+        )
+
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["error_code"], "invalid_config")
+        self.assertEqual(payload["details"]["issue_code"], "responses_requires_openai_model_provider")
+        mock_completion.assert_not_called()
+
+    @patch("litellm.completion")
     @patch("src.services.system_config_service.Config._load_from_env")
     def test_test_llm_channel_uses_runtime_temperature_for_non_kimi_models(
         self,
@@ -3219,6 +4112,56 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.assertEqual(mock_completion.call_count, 3)
         self.assertEqual(mock_completion.call_args_list[1].kwargs["response_format"], {"type": "json_object"})
         self.assertEqual(mock_completion.call_args_list[2].kwargs["tool_choice"]["function"]["name"], "dsa_probe_echo")
+
+    @patch("litellm.completion")
+    def test_test_llm_channel_json_capability_ignores_minimax_reasoning_blocks(self, mock_completion) -> None:
+        mock_completion.side_effect = [
+            self._mock_completion_response("OK"),
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": None,
+                            "content_blocks": [
+                                {"type": "reasoning", "content": "Internal reasoning"},
+                                {"type": "text", "text": '{"status":"ok"}'},
+                            ],
+                        }
+                    }
+                ]
+            },
+        ]
+
+        payload = self.service.test_llm_channel(
+            name="minimax",
+            protocol="openai",
+            base_url="https://api.minimax.io/v1",
+            api_key="sk-test-value",
+            models=["MiniMax-M3"],
+            capability_checks=["json"],
+        )
+
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["capability_results"]["json"]["status"], "passed")
+
+    @patch("litellm.completion")
+    def test_test_llm_channel_json_capability_strips_minimax_think_wrapper(self, mock_completion) -> None:
+        mock_completion.side_effect = [
+            self._mock_completion_response("OK"),
+            self._mock_completion_response('<think>Internal reasoning</think>{"status":"ok"}'),
+        ]
+
+        payload = self.service.test_llm_channel(
+            name="minimax",
+            protocol="openai",
+            base_url="https://api.minimax.io/v1",
+            api_key="sk-test-value",
+            models=["MiniMax-M3"],
+            capability_checks=["json"],
+        )
+
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["capability_results"]["json"]["status"], "passed")
 
     @patch("litellm.completion")
     def test_test_llm_channel_reports_json_capability_failures(self, mock_completion) -> None:
@@ -3593,12 +4536,31 @@ class SystemConfigServiceTestCase(unittest.TestCase):
     ) -> None:
         response = self.service.update(
             config_version=self.manager.get_config_version(),
-            items=[{"key": "STOCK_LIST", "value": "600519"}],
+            items=[{"key": "LOG_LEVEL", "value": "DEBUG"}],
             reload_now=True,
         )
 
         self.assertTrue(response["success"])
         mock_reload_runtime_singletons.assert_called_once()
+
+    @patch.object(SystemConfigService, "_reload_runtime_singletons")
+    def test_update_with_reload_skips_singleton_reset_for_stock_list_only(
+        self,
+        mock_reload_runtime_singletons,
+    ) -> None:
+        """A STOCK_LIST-only save must not reset runtime singletons.
+
+        Resetting them would re-run setup_env(override=True) and clobber
+        container environment overrides for every other key.
+        """
+        response = self.service.update(
+            config_version=self.manager.get_config_version(),
+            items=[{"key": "STOCK_LIST", "value": "600519"}],
+            reload_now=True,
+        )
+
+        self.assertTrue(response["success"])
+        mock_reload_runtime_singletons.assert_not_called()
 
     def test_update_with_reload_applies_updated_env_file_when_process_env_is_stale(self) -> None:
         os.environ["STOCK_LIST"] = "600519,000001"
