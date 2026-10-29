@@ -149,6 +149,17 @@
 
 {% endif %}
 
+{# >>> AI 决策信号输出逻辑：修改位置 1，完整报告中输出 #}
+{% set decision_signal_summary = result.decision_signal_summary | default(none, true) %}
+{% if decision_signal_summary %}
+{% set decision_signal_text = format_decision_signal_excerpt(decision_signal_summary, report_language) %}
+{% if decision_signal_text %}
+{{ decision_signal_text }}
+
+{% endif %}
+{% endif %}
+{# <<< AI 决策信号输出逻辑结束 #}
+
 {% set signal_attr = dashboard.get('signal_attribution') or {} %}
 {% set signal_attr_weights = signal_attribution_weight_items(signal_attr) %}
 {% if signal_attribution_has_content(signal_attr) %}

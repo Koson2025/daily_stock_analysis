@@ -16,6 +16,9 @@ from typing import Any, Dict, List, Optional
 from src.analyzer import AnalysisResult
 from src.config import get_config
 from src.market_phase_summary import format_public_market_status_line, format_public_phase_pack_excerpt
+# >>> AI 决策信号模块：新增导入（修改位置 1）1029
+from src.services.decision_signal_summary import format_decision_signal_excerpt
+# <<< AI 决策信号模块：新增导入结束
 from src.report_language import (
     get_localized_stock_name,
     get_report_labels,
@@ -223,6 +226,9 @@ def render(
         "hold_count": hold_count,
         "labels": labels,
         "report_language": report_language,
+        # >>> AI 决策信号模块：向 Jinja2 模板注册格式化函数（修改位置 2）1029
+        "format_decision_signal_excerpt": format_decision_signal_excerpt,
+        # <<< AI 决策信号模块：注册结束
         "models_used": models_used,
         "show_llm_model": show_llm_model,
         "market_status_line": market_status_line(),
