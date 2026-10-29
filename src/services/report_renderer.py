@@ -141,6 +141,30 @@ def render(
     )
     labels = get_report_labels(report_language)
 
+    # Diagnose whether the AI decision signal reaches the report renderer.
+    # This is intentionally observational: it does not alter rendering behavior.
+    logger.warning(
+        "REPORT_RENDER_DIAGNOSTIC template=%s summary_only=%s result_count=%s",
+        template_path,
+        summary_only,
+        len(results or []),
+    )
+    for result in results or []:
+        decision_summary = getattr(result, "decision_signal_summary", None)
+        if isinstance(decision_summary, dict):
+            summary_fields = sorted(decision_summary.keys())
+        elif decision_summary is None:
+            summary_fields = []
+        else:
+            summary_fields = [f"<non-dict:{type(decision_summary).__name__}>"]
+        logger.warning(
+            "REPORT_RENDER_DECISION_SIGNAL code=%s present=%s type=%s fields=%s",
+            getattr(result, "code", None),
+            bool(decision_summary),
+            type(decision_summary).__name__,
+            summary_fields,
+        )
+
     # Build template context with pre-computed signal levels (sorted by score)
     sorted_results = sorted(results, key=lambda x: x.sentiment_score, reverse=True)
     sorted_enriched = []
