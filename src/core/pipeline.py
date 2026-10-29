@@ -2927,10 +2927,43 @@ class StockAnalysisPipeline:
                 profile_source="auto_default",
                 market_override=market_override,
             )
-            if isinstance(signal_result, dict):
-                summary = summarize_decision_signal(signal_result.get("item"))
-                if summary:
-                    setattr(result, "decision_signal_summary", summary)
+            stock_code = getattr(result, "code", None)
+            if not isinstance(signal_result, dict):
+                logger.warning(
+                    "DecisionSignal extraction returned no dict: "
+                    "query_id=%s stock_code=%s result_type=%s source_report_id=%s",
+                    query_id,
+                    stock_code,
+                    type(signal_result).__name__,
+                    source_report_id,
+                )
+                return
+
+            item = signal_result.get("item")
+            summary = summarize_decision_signal(item)
+            if not summary:
+                logger.warning(
+                    "DecisionSignal summary is empty: "
+                    "query_id=%s stock_code=%s item_type=%s result_keys=%s "
+                    "created=%s source_report_id=%s",
+                    query_id,
+                    stock_code,
+                    type(item).__name__,
+                    sorted(str(key) for key in signal_result.keys()),
+                    signal_result.get("created"),
+                    source_report_id,
+                )
+                return
+
+            setattr(result, "decision_signal_summary", summary)
+            logger.info(
+                "DecisionSignal summary attached: "
+                "query_id=%s stock_code=%s summary_fields=%s source_report_id=%s",
+                query_id,
+                stock_code,
+                sorted(str(key) for key in summary.keys()),
+                source_report_id,
+            )
         except Exception as exc:
             logger.warning(
                 "Decision signal extraction skipped after history save: query_id=%s stock_code=%s error=%s",
