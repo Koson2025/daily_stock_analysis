@@ -1286,22 +1286,8 @@ class NotificationService(
         ma_label = _nlabel("Moving Averages", "均线", "이동평균")
         volume_analysis_label = _nlabel("Volume", "量能", "거래량")
         news_heading = _nlabel("News Flow", "消息面", "뉴스 흐름")
-        # ============================================================
-        # 完整 Markdown 仪表盘报告：优先使用 Jinja2 模板渲染器
-        #
-        # 修改说明：
-        # 1. 原逻辑受 REPORT_RENDERER_ENABLED 配置控制，默认关闭；
-        # 2. 关闭时会直接走旧的字符串拼接逻辑，模板中的 AI 决策信号
-        #    （decision_signal_summary）因此无法展示；
-        # 3. 修改为只要存在分析结果，就尝试使用 Markdown 模板渲染器；
-        # 4. 本次只调整 generate_dashboard_report()，不修改企业微信、
-        #    简报等其他渲染入口；
-        # 5. 如果模板渲染失败或没有返回内容，继续执行下方原有逻辑，
-        #    保留旧版 Markdown 报告作为兜底。
-        # ============================================================
-        if results:
+        if getattr(config, 'report_renderer_enabled', False) and results:
             from src.services.report_renderer import render
-
             out = render(
                 platform='markdown',
                 results=results,
@@ -1312,8 +1298,6 @@ class NotificationService(
                     "report_language": report_language,
                 },
             )
-
-            # 模板成功生成报告时直接返回；否则继续使用下方原有报告逻辑。
             if out:
                 return out
 
