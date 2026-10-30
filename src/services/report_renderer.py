@@ -10,6 +10,7 @@ Any expensive data preparation should be injected by the caller via extra_contex
 """
 
 import logging
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -288,9 +289,17 @@ def render(
         env = Environment(
             loader=FileSystemLoader(str(templates_dir)),
             autoescape=select_autoescape(default=False),
+            # 删除 Jinja 控制语句自身产生的多余换行和行首空白。
+            trim_blocks=True,
+            lstrip_blocks=True,
         )
         template = env.get_template(template_name)
-        return template.render(**context)
+        rendered = template.render(**context)
+
+        # Markdown 区块之间保留一个空行；将连续 3 个及以上换行压缩为 2 个。
+        # 不改写表格、列表、标题或正文内容，只清理无意义的纵向留白。
+        rendered = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", rendered)
+        return rendered.strip() + "\n" if rendered.strip() else ""
     except Exception as e:
         logger.warning("Report render failed for %s: %s", template_name, e)
         return None
